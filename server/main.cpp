@@ -7,10 +7,16 @@
 #include <map>
 #include <algorithm>
 
+
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <linux/ip.h>
+
 using namespace std;
 
-string siteData;
+char * buffer = new char[65536];
 
+string siteData;
 map<string, string> headers;
 
 size_t writeCallback(char * buf, size_t size, size_t nmemb, void * up){
@@ -69,7 +75,7 @@ int main(int argc, char *argv[]){
     cout << "Creating Socket" << endl;
 
     int socketDescriptor;
-    if((socketDescriptor = socket(AF_INET, SOCK_STREAM, 0)) == -1){
+    if((socketDescriptor = socket(AF_INET, SOCK_STREAM,  0)) == -1){
         perror("Failed To Create Socket");
         exit(1);
     }
@@ -99,135 +105,241 @@ int main(int argc, char *argv[]){
         cout << "Main - Port Binding Complete" << endl;
     }
 
-
+    cout << "Now Listening" << endl;
     //set socket to start listening
     listen(socketDescriptor, 10);
 
 
-    while(1){
+    cout << "Now Setting Up Raw Socket To Listen" << endl;
 
-        struct  sockaddr_in client;
-        int socketSessionDescriptor;
-        socklen_t client_len= sizeof(client);
-        if((socketSessionDescriptor = accept(socketDescriptor, (struct sockaddr *)&client,&client_len)) == -1){
-            cout << " ERROR - Can't Accept Client Connection Request" << endl;
-            exit(1);
-        }
+    //the connection has been accepted, now get a raw socket going to start listening
+    int rawSocketDescriptor;
+    if((rawSocketDescriptor = socket(AF_INET, SOCK_RAW, IPPROTO_TCP)) == -1){
+        perror("Failed To Create Raw Socket");
+        exit(1);
+    }
 
+
+    struct iphdr *iph;
+    struct tcphdr *tcph;
+    char * payload;
+    long payloadlen;
+
+
+    struct  sockaddr_in client;
+    int socketSessionDescriptor;
+    socklen_t client_len= sizeof(client);
+    if((socketSessionDescriptor = accept(socketDescriptor, (struct sockaddr *)&client,&client_len)) == -1){
+        cout << " ERROR - Can't Accept Client Connection Request" << endl;
+        exit(1);
+    }
+
+    cout << "Connecting Was Accepted" << endl;
+
+
+
+    while(1) {
 
         const int BUFFERSIZE = 4096;
         char inbuf[BUFFERSIZE];
 
-        long bytesRead = read(socketSessionDescriptor, inbuf, BUFFERSIZE - 1);
+        long bytesRead = read(rawSocketDescriptor, buffer, 9999);
 
-        if(bytesRead == 0){
+        if (bytesRead == 0) {
             cout << "There Are 0 Bytes To Be Read ?" << endl;
         }
 
-        string data(inbuf);
-        cout << " *** NEW INCOMING REQUEST ***" << endl;
-        cout << "BYTES READ: " << bytesRead << endl;
-        cout << "Received Data: " << endl;
-        cout << ">" << data << "<" << endl;
+        //get ip header data
+        iph = (struct iphdr*)buffer;
+        int iphdrlen = (iph->ihl*4);
+        tcph = (struct tcphdr*)(buffer + iphdrlen);
+        int tcphdrlen = (tcph->doff*4);
+
+        payload = (buffer + iphdrlen + tcphdrlen);
+        payloadlen = bytesRead - iphdrlen - tcphdrlen;
+
+        //i want the initial push packet
+        if (ntohs(tcph->th_dport) == 8080 && tcph->psh == 1) {
+            cout << "FOUND A MATCH" << endl;
+            cout << "RAW: " << tcph->th_dport << endl;
+            cout << ntohs(tcph->th_dport) << endl;
+            cout << tcph->psh << endl;
+            break;
+        } else {
+
+            //cout << "DEST IS NOT 8080. ITS NOT OUR PACKET" << endl;
+            //cout << "RAW: " << recv_pkt.tcp.th_dport << endl;
+            //cout << ntohs(recv_pkt.tcp.th_dport) << endl;
+            continue;
+        }
+    }
+
+   /* cout << " Cycling Payload" << endl;
+    cout << "Payload Length: " << payloadlen << endl;
+    for(int i = 0 ; i < payloadlen; ++i){
+        cout << "Character PRinting" << endl;
+        printf(">%c<", payload[i]);
+    }
+*/
+    string data(payload, payloadlen);
+    cout << " *** NEW INCOMING REQUEST ***" << endl;
+    cout << "Received Data: " << endl;
+    cout << ">" << data << "<" << endl;
 
 
-        CURL * curl;
+    CURL * curl;
+    curl_global_init(CURL_GLOBAL_ALL);
+    curl = curl_easy_init();
+
+    curl_easy_setopt(curl, CURLOPT_URL, "https://facebook.com/");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &writeCallback);
+    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &headerCallback);
+
+    struct curl_slist *chunk = NULL;
+    chunk = curl_slist_append(chunk, "User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.101 Safari/537.36");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+
+    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+
+    curl_easy_perform(curl);
+
+    cout << "CURL RESPONSE DATA" << endl;
+    cout << endl << siteData << endl;
+
+    cout << "CURL HEADER DATA" << endl;
+    for_each(headers.begin(), headers.end(), [](std::pair<const string,string> mappingEntry){
+        cout << "--------" << endl;
+        cout << "Header: >" << mappingEntry.first << "<" << endl;
+        cout << "Value: >" << mappingEntry.second << "<" << endl;
+        cout << "--------" << endl;
+    });
+
+    curl_easy_cleanup(curl);
+    curl_global_cleanup();
+
+    if(headers.count("Location")){
+        cout << "Found Location Header Present!" << endl;
+        string redirectLocation = headers["Location"];
+        cout << "Location Header: >" << redirectLocation << "<" << endl;
+
+        siteData.clear();
+        headers.clear();
+
+        CURL * curl2;
         curl_global_init(CURL_GLOBAL_ALL);
-        curl = curl_easy_init();
+        curl2 = curl_easy_init();
 
-        curl_easy_setopt(curl, CURLOPT_URL, "https://facebook.com/");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &writeCallback);
-        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &headerCallback);
+        curl_easy_setopt(curl2, CURLOPT_URL, redirectLocation.c_str());
+        curl_easy_setopt(curl2, CURLOPT_WRITEFUNCTION, &writeCallback);
+        //curl_easy_setopt(curl2, CURLOPT_HEADER, 1);
+        //curl_easy_setopt(curl2, CURLOPT_HEADERFUNCTION, &headerCallback);
+        curl_easy_setopt(curl2, CURLOPT_VERBOSE, 1L);
 
         struct curl_slist *chunk = NULL;
         chunk = curl_slist_append(chunk, "User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.101 Safari/537.36");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+        curl_easy_setopt(curl2, CURLOPT_HTTPHEADER, chunk);
 
-        curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
+        curl_easy_perform(curl2);
 
-        curl_easy_perform(curl);
-
-        cout << "CURL RESPONSE DATA" << endl;
+        cout << "CURL REDIRECT RESPONSE DATA" << endl;
         cout << endl << siteData << endl;
 
-        cout << "CURL HEADER DATA" << endl;
-        for_each(headers.begin(), headers.end(), [](std::pair<const string,string> mappingEntry){
-            cout << "--------" << endl;
-            cout << "Header: >" << mappingEntry.first << "<" << endl;
-            cout << "Value: >" << mappingEntry.second << "<" << endl;
-            cout << "--------" << endl;
-        });
-
-        curl_easy_cleanup(curl);
+        curl_easy_cleanup(curl2);
         curl_global_cleanup();
 
-        if(headers.count("Location")){
-            cout << "Found Location Header Present!" << endl;
-            string redirectLocation = headers["Location"];
-            cout << "Location Header: >" << redirectLocation << "<" << endl;
-
-            siteData.clear();
-            headers.clear();
-
-            CURL * curl2;
-            curl_global_init(CURL_GLOBAL_ALL);
-            curl2 = curl_easy_init();
-
-            curl_easy_setopt(curl2, CURLOPT_URL, redirectLocation.c_str());
-            curl_easy_setopt(curl2, CURLOPT_WRITEFUNCTION, &writeCallback);
-            //curl_easy_setopt(curl2, CURLOPT_HEADER, 1);
-            //curl_easy_setopt(curl2, CURLOPT_HEADERFUNCTION, &headerCallback);
-            curl_easy_setopt(curl2, CURLOPT_VERBOSE, 1L);
-
-            struct curl_slist *chunk = NULL;
-            chunk = curl_slist_append(chunk, "User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/53.0.2785.101 Safari/537.36");
-            curl_easy_setopt(curl2, CURLOPT_HTTPHEADER, chunk);
-
-            curl_easy_perform(curl2);
-
-            cout << "CURL REDIRECT RESPONSE DATA" << endl;
-            cout << endl << siteData << endl;
-
-            curl_easy_cleanup(curl2);
-            curl_global_cleanup();
-
-        }
-
-
-        cout << "DONE WITH CURL" << endl;
-
-        char * buf;
-        char * body;
-
-
-        buf = "HTTP/1.1 200 OK\r\n";
-        send(socketSessionDescriptor, buf, strlen(buf), 0);
-
-        buf = "Server: eoPanel Server\r\n";
-        send(socketSessionDescriptor, buf, strlen(buf), 0);
-
-        buf = "Content-Type: text/html; charset=ISO-8859-1\r\n";
-        send(socketSessionDescriptor, buf, strlen(buf), 0);
-
-        string contLength;
-        contLength = "Content-Length: " + to_string(siteData.length()) + "\r\n";
-        send(socketSessionDescriptor, contLength.c_str(), contLength.length(), 0);
-
-        buf = "\r\n";
-        send(socketSessionDescriptor, buf, strlen(buf), 0);
-
-
-
-        //body = "<h2> Weclome </h2>";
-        send(socketSessionDescriptor, siteData.c_str(), siteData.length(), 0);
-
-
-        //send(socketSessionDescriptor, siteData.c_str(), siteData.length(), 0);
-
-
-
-        shutdown(socketSessionDescriptor, SHUT_RDWR);
-        close(socketSessionDescriptor);
-
     }
+
+
+    cout << "DONE WITH CURL" << endl;
+    cout << "Site Data Length: " << siteData.length() << " bytes" << endl;
+
+    char * buf;
+    char * body;
+
+    struct send_tcp
+    {
+        struct iphdr ip;
+        struct tcphdr tcp;
+    } send_tcp;
+
+    struct pseudo_header
+    {
+        unsigned int source_address;
+        unsigned int dest_address;
+        unsigned char placeholder;
+        unsigned char protocol;
+        unsigned short tcp_length;
+        struct tcphdr tcp;
+    } pseudo_header;
+
+    struct sockaddr_in sin;
+
+
+    //set ip info and length
+    send_tcp.ip.ihl = 5;
+    send_tcp.ip.version = 4;
+    send_tcp.ip.tos = 0;
+    send_tcp.ip.tot_len = htons(40);
+    send_tcp.ip.id =(int)(255.0*rand()/(RAND_MAX+1.0));
+
+    send_tcp.ip.frag_off = 0;
+    send_tcp.ip.ttl = 64;
+    send_tcp.ip.protocol = IPPROTO_TCP;
+    send_tcp.ip.check = 0;
+    send_tcp.ip.saddr = iph->daddr;
+    send_tcp.ip.daddr = iph->saddr;
+
+    //set tcp info
+    send_tcp.tcp.source = tcph->dest;
+    send_tcp.tcp.dest = tcph->source;
+
+    send_tcp.tcp.ack_seq = 0;
+    send_tcp.tcp.res1 = 0;
+    send_tcp.tcp.doff = 5;
+    send_tcp.tcp.fin = 0;
+    send_tcp.tcp.syn = 0;
+    send_tcp.tcp.rst = 0;
+    send_tcp.tcp.psh = 1;
+    send_tcp.tcp.ack = 1;
+    send_tcp.tcp.urg = 0;
+    send_tcp.tcp.res2 = 0;
+    send_tcp.tcp.window = htons(512);
+    send_tcp.tcp.check = 0;
+    send_tcp.tcp.urg_ptr = 0;
+
+    sin.sin_family = AF_INET;
+    sin.sin_port = send_tcp.tcp.source;
+    sin.sin_addr.s_addr = send_tcp.ip.daddr;
+
+
+    /*buf = "HTTP/1.1 200 OK\r\n";
+    send(socketSessionDescriptor, buf, strlen(buf), 0);
+
+    buf = "Server: eoPanel Server\r\n";
+    send(socketSessionDescriptor, buf, strlen(buf), 0);
+
+    buf = "Content-Type: text/html; charset=ISO-8859-1\r\n";
+    send(socketSessionDescriptor, buf, strlen(buf), 0);
+
+    string contLength;
+    contLength = "Content-Length: " + to_string(siteData.length()) + "\r\n";
+    send(socketSessionDescriptor, contLength.c_str(), contLength.length(), 0);
+
+    buf = "\r\n";
+    send(socketSessionDescriptor, buf, strlen(buf), 0);
+
+
+
+    //body = "<h2> Weclome </h2>";
+    send(socketSessionDescriptor, siteData.c_str(), siteData.length(), 0);
+
+
+    //send(socketSessionDescriptor, siteData.c_str(), siteData.length(), 0);
+
+
+
+    shutdown(socketSessionDescriptor, SHUT_RDWR);
+    close(socketSessionDescriptor);*/
+
+
 }
