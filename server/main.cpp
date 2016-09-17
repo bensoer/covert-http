@@ -10,7 +10,13 @@
 
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#include <linux/ip.h>
+//#include <linux/ip.h>
+
+
+
+#include <netinet/ip.h>       // struct ip and IP_MAXPACKET (which is 65535)
+
+//#include <errno.h>
 
 using namespace std;
 
@@ -18,6 +24,41 @@ char * buffer = new char[65536];
 
 string siteData;
 map<string, string> headers;
+
+unsigned short in_cksum(unsigned short *ptr, int nbytes)
+{
+    register long		sum;		/* assumes long == 32 bits */
+    u_short			oddbyte;
+    register u_short	answer;		/* assumes u_short == 16 bits */
+
+    /*
+     * Our algorithm is simple, using a 32-bit accumulator (sum),
+     * we add sequential 16-bit words to it, and at the end, fold back
+     * all the carry bits from the top 16 bits into the lower 16 bits.
+     */
+
+    sum = 0;
+    while (nbytes > 1)  {
+        sum += *ptr++;
+        nbytes -= 2;
+    }
+
+    /* mop up an odd byte, if necessary */
+    if (nbytes == 1) {
+        oddbyte = 0;		/* make sure top half is zero */
+        *((u_char *) &oddbyte) = *(u_char *)ptr;   /* one byte only */
+        sum += oddbyte;
+    }
+
+    /*
+     * Add back carry outs from top 16 bits to low 16 bits.
+     */
+
+    sum  = (sum >> 16) + (sum & 0xffff);	/* add high-16 to low-16 */
+    sum += (sum >> 16);			/* add carry */
+    answer = ~sum;		/* ones-complement, then truncate to 16 bits */
+    return(answer);
+}
 
 size_t writeCallback(char * buf, size_t size, size_t nmemb, void * up){
 
@@ -140,8 +181,6 @@ int main(int argc, char *argv[]){
 
     while(1) {
 
-        const int BUFFERSIZE = 4096;
-        char inbuf[BUFFERSIZE];
 
         long bytesRead = read(rawSocketDescriptor, buffer, 9999);
 
@@ -260,6 +299,7 @@ int main(int argc, char *argv[]){
     {
         struct iphdr ip;
         struct tcphdr tcp;
+        char payload[10000];
     } send_tcp;
 
     struct pseudo_header
@@ -293,7 +333,8 @@ int main(int argc, char *argv[]){
     send_tcp.tcp.source = tcph->dest;
     send_tcp.tcp.dest = tcph->source;
 
-    send_tcp.tcp.ack_seq = 0;
+
+    send_tcp.tcp.th_ack = tcph->seq + 1;
     send_tcp.tcp.res1 = 0;
     send_tcp.tcp.doff = 5;
     send_tcp.tcp.fin = 0;
@@ -310,6 +351,65 @@ int main(int argc, char *argv[]){
     sin.sin_family = AF_INET;
     sin.sin_port = send_tcp.tcp.source;
     sin.sin_addr.s_addr = send_tcp.ip.daddr;
+
+    int send_socket = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if(send_socket < 0)
+    {
+        perror("send socket cannot be open. Are you root?");
+        exit(1);
+    }
+
+    int on = 1;
+    if (setsockopt (send_socket, IPPROTO_IP, IP_HDRINCL, &on, sizeof (on)) < 0) {
+        perror ("setsockopt() failed to set IP_HDRINCL ");
+        exit (EXIT_FAILURE);
+    }
+
+    /* Make IP header checksum */
+    send_tcp.ip.check = in_cksum((unsigned short *)&send_tcp.ip, 20);
+    /* Final preparation of the full header */
+
+    /* From synhose.c by knight */
+    pseudo_header.source_address = send_tcp.ip.saddr;
+    pseudo_header.dest_address = send_tcp.ip.daddr;
+    pseudo_header.placeholder = 0;
+    pseudo_header.protocol = IPPROTO_TCP;
+    pseudo_header.tcp_length = htons(20);
+
+    uint8_t *packet = (uint8_t *)malloc(IP_MAXPACKET * sizeof(uint8_t));
+
+    bcopy((char *)&send_tcp.tcp, (char *)&pseudo_header.tcp, 20);
+    /* Final checksum on the entire package */
+    send_tcp.tcp.check = in_cksum((unsigned short *)&pseudo_header, 32);
+
+    bcopy((char *)&send_tcp.tcp, (char *)&pseudo_header.tcp, 20);
+    /* Final checksum on the entire package */
+    send_tcp.tcp.check = in_cksum((unsigned short *)&pseudo_header, 32);
+
+    sendto(send_socket, &send_tcp, 40 + (sizeof(char) * 1000), 0, (struct sockaddr *)&sin, sizeof(sin));
+
+//    const int IP4_HDRLEN = 20;
+//    const int TCP_HDRLEN = 20;
+
+    // First part is an IPv4 header.
+//    memcpy (packet, &send_tcp.ip, IP4_HDRLEN * sizeof (uint8_t));
+
+    // Next part of packet is upper layer protocol header.
+//    memcpy ((packet + IP4_HDRLEN), &send_tcp.tcp, TCP_HDRLEN * sizeof (uint8_t));
+
+    // Last part is upper layer protocol data.
+//    memcpy ((packet + IP4_HDRLEN + TCP_HDRLEN), payload, payloadlen * sizeof (uint8_t));
+
+
+    /* Away we go.... */
+//    sendto(send_socket, packet, IP4_HDRLEN + TCP_HDRLEN + payloadlen, 0, (struct sockaddr *)&sin, sizeof(sin));
+    //printf("Sending Data: %c\n",ch);
+
+    while(1){
+
+    }
+
+    close(send_socket);
 
 
     /*buf = "HTTP/1.1 200 OK\r\n";
