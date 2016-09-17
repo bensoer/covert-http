@@ -25,6 +25,19 @@ char * buffer = new char[65536];
 string siteData;
 map<string, string> headers;
 
+
+/*
+    96 bit (12 bytes) pseudo header needed for tcp header checksum calculation
+*/
+struct pseudo_header
+{
+    u_int32_t source_address;
+    u_int32_t dest_address;
+    u_int8_t placeholder;
+    u_int8_t protocol;
+    u_int16_t tcp_length;
+};
+
 unsigned short in_cksum(unsigned short *ptr, int nbytes)
 {
     register long		sum;		/* assumes long == 32 bits */
@@ -57,6 +70,33 @@ unsigned short in_cksum(unsigned short *ptr, int nbytes)
     sum  = (sum >> 16) + (sum & 0xffff);	/* add high-16 to low-16 */
     sum += (sum >> 16);			/* add carry */
     answer = ~sum;		/* ones-complement, then truncate to 16 bits */
+    return(answer);
+}
+
+/*
+    Generic checksum calculation function
+*/
+unsigned short csum(unsigned short *ptr,int nbytes)
+{
+    register long sum;
+    unsigned short oddbyte;
+    register short answer;
+
+    sum=0;
+    while(nbytes>1) {
+        sum+=*ptr++;
+        nbytes-=2;
+    }
+    if(nbytes==1) {
+        oddbyte=0;
+        *((u_char*)&oddbyte)=*(u_char*)ptr;
+        sum+=oddbyte;
+    }
+
+    sum = (sum>>16)+(sum & 0xffff);
+    sum = sum + (sum>>16);
+    answer=(short)~sum;
+
     return(answer);
 }
 
@@ -108,6 +148,114 @@ size_t headerCallback(char * buffer, size_t size, size_t nitems, void * userdata
     headers.insert(pair<string, string>(headerSub, cleanValue));
 
     return size*nitems; //tell curl how many bytes we handled
+}
+
+void sendPacket(string sourceAddress, string destinationAddress, int sourcePort, int destPort, unsigned int sequence, unsigned int ack, const char * payloadData){
+    cout << "Received Source Address Of: " << sourceAddress << endl;
+    cout << "Received Destination Address Of: " << destinationAddress << endl;
+
+    int s;
+    if((s = socket(AF_INET, SOCK_RAW,  IPPROTO_TCP)) == -1){
+        perror("Failed To Create Raw Socket");
+        exit(1);
+    }
+
+    char datagram[4096];
+    char source_ip[32];
+    char *data;
+    char *pseudogram;
+
+    memset(datagram, 0, 4096);
+
+    //IP header
+    struct iphdr *iph = (struct iphdr *) datagram;
+
+    //TCP header
+    struct tcphdr *tcph = (struct tcphdr *) (datagram + sizeof (struct ip));
+    struct sockaddr_in sin;
+    struct pseudo_header psh;
+
+    //Data part
+    data = datagram + sizeof(struct iphdr) + sizeof(struct tcphdr);
+    //strcpy(data , "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    strcpy(data , payloadData);
+
+    //some address resolution
+    strcpy(source_ip , sourceAddress.c_str()); // source address
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(80);
+    sin.sin_addr.s_addr = inet_addr (destinationAddress.c_str()); //destination address
+
+
+
+    //Fill in the IP Header
+    iph->ihl = 5;
+    iph->version = 4;
+    iph->tos = 0;
+    iph->tot_len = sizeof (struct iphdr) + sizeof (struct tcphdr) + strlen(data);
+    iph->id = htonl (54321); //Id of this packet
+    iph->frag_off = 0;
+    iph->ttl = 255;
+    iph->protocol = IPPROTO_TCP;
+    iph->check = 0;      //Set to 0 before calculating checksum
+    iph->saddr = inet_addr ( source_ip );    //Spoof the source ip address
+    iph->daddr = sin.sin_addr.s_addr;
+
+    //Ip checksum
+    iph->check = csum ((unsigned short *) datagram, iph->tot_len);
+
+    //TCP Header
+    tcph->source = htons (sourcePort);
+    tcph->dest = htons (destPort);
+    tcph->seq = htonl(sequence);
+    tcph->ack_seq = htonl(ack);
+    tcph->doff = 5;  //tcp header size
+    tcph->fin=0;
+    tcph->syn=0;
+    tcph->rst=0;
+    tcph->psh=1;
+    tcph->ack=1;
+    tcph->urg=0;
+    tcph->window = htons (5840); /* maximum allowed window size */
+    tcph->check = 0; //leave checksum 0 now, filled later by pseudo header
+    tcph->urg_ptr = 0;
+
+    //Now the TCP checksum
+    psh.source_address = inet_addr( source_ip );
+    psh.dest_address = sin.sin_addr.s_addr;
+    psh.placeholder = 0;
+    psh.protocol = IPPROTO_TCP;
+    psh.tcp_length = htons(sizeof(struct tcphdr) + strlen(data) );
+
+    int psize = sizeof(struct pseudo_header) + sizeof(struct tcphdr) + strlen(data);
+    pseudogram = (char *)malloc(psize);
+
+    memcpy(pseudogram , (char*) &psh , sizeof (struct pseudo_header));
+    memcpy(pseudogram + sizeof(struct pseudo_header) , tcph , sizeof(struct tcphdr) + strlen(data));
+
+    //IP_HDRINCL to tell the kernel that headers are included in the packet
+    int one = 1;
+    const int *val = &one;
+
+    if (setsockopt (s, IPPROTO_IP, IP_HDRINCL, val, sizeof (one)) < 0)
+    {
+        perror("Error setting IP_HDRINCL");
+        exit(0);
+    }
+
+    //Send the packet
+    if (sendto (s, datagram, iph->tot_len ,  0, (struct sockaddr *) &sin, sizeof (sin)) < 0)
+    {
+        perror("sendto failed");
+    }
+        //Data send successfully
+    else
+    {
+        printf ("Packet Send. Length : %d \n" , iph->tot_len);
+    }
+
+    close(s);
+
 }
 
 int main(int argc, char *argv[]){
@@ -270,8 +418,8 @@ int main(int argc, char *argv[]){
 
         curl_easy_setopt(curl2, CURLOPT_URL, redirectLocation.c_str());
         curl_easy_setopt(curl2, CURLOPT_WRITEFUNCTION, &writeCallback);
-        //curl_easy_setopt(curl2, CURLOPT_HEADER, 1);
-        //curl_easy_setopt(curl2, CURLOPT_HEADERFUNCTION, &headerCallback);
+        curl_easy_setopt(curl2, CURLOPT_HEADER, 1);
+        curl_easy_setopt(curl2, CURLOPT_HEADERFUNCTION, &headerCallback);
         curl_easy_setopt(curl2, CURLOPT_VERBOSE, 1L);
 
         struct curl_slist *chunk = NULL;
@@ -295,121 +443,29 @@ int main(int argc, char *argv[]){
     char * buf;
     char * body;
 
-    struct send_tcp
-    {
-        struct iphdr ip;
-        struct tcphdr tcp;
-        char payload[10000];
-    } send_tcp;
+    char recvDest[INET_ADDRSTRLEN];
+    char recvSrc[INET_ADDRSTRLEN];
 
-    struct pseudo_header
-    {
-        unsigned int source_address;
-        unsigned int dest_address;
-        unsigned char placeholder;
-        unsigned char protocol;
-        unsigned short tcp_length;
-        struct tcphdr tcp;
-    } pseudo_header;
+    inet_ntop(AF_INET, &iph->daddr, recvDest, INET_ADDRSTRLEN);
+    inet_ntop(AF_INET, &iph->saddr, recvSrc, INET_ADDRSTRLEN);
 
-    struct sockaddr_in sin;
+    unsigned int ack = ntohl(tcph->ack_seq);
+    unsigned int seq = ntohl(tcph->seq);
 
+    cout << "Received Src: " << recvSrc << endl;
+    cout << "Received Dest: " << recvDest << endl;
+    cout << "Received SrcPort: " << ntohs(tcph->th_sport) << endl;
+    cout << "Received DestPort: " << ntohs(tcph->th_dport) << endl;
+    cout << "Received Sequence Number: " << seq << endl;
+    cout << "Received Acknowledgement Number: " << ack << endl;
 
-    //set ip info and length
-    send_tcp.ip.ihl = 5;
-    send_tcp.ip.version = 4;
-    send_tcp.ip.tos = 0;
-    send_tcp.ip.tot_len = htons(40);
-    send_tcp.ip.id =(int)(255.0*rand()/(RAND_MAX+1.0));
+    string http = "HTTP/1.1 200 OK\r\nServer: eoPanel Server\r\nContent-Type: text/html;charset=UTF-8\r\nContent-Length: 18\r\n\r\n<h2>Welcome</h2>";
 
-    send_tcp.ip.frag_off = 0;
-    send_tcp.ip.ttl = 64;
-    send_tcp.ip.protocol = IPPROTO_TCP;
-    send_tcp.ip.check = 0;
-    send_tcp.ip.saddr = iph->daddr;
-    send_tcp.ip.daddr = iph->saddr;
-
-    //set tcp info
-    send_tcp.tcp.source = tcph->dest;
-    send_tcp.tcp.dest = tcph->source;
+    sendPacket(recvDest, recvSrc, ntohs(tcph->th_dport), ntohs(tcph->th_sport), ack, seq + 1, http.c_str());
 
 
-    send_tcp.tcp.th_ack = tcph->seq + 1;
-    send_tcp.tcp.res1 = 0;
-    send_tcp.tcp.doff = 5;
-    send_tcp.tcp.fin = 0;
-    send_tcp.tcp.syn = 0;
-    send_tcp.tcp.rst = 0;
-    send_tcp.tcp.psh = 1;
-    send_tcp.tcp.ack = 1;
-    send_tcp.tcp.urg = 0;
-    send_tcp.tcp.res2 = 0;
-    send_tcp.tcp.window = htons(512);
-    send_tcp.tcp.check = 0;
-    send_tcp.tcp.urg_ptr = 0;
+    close(socketSessionDescriptor);
 
-    sin.sin_family = AF_INET;
-    sin.sin_port = send_tcp.tcp.source;
-    sin.sin_addr.s_addr = send_tcp.ip.daddr;
-
-    int send_socket = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if(send_socket < 0)
-    {
-        perror("send socket cannot be open. Are you root?");
-        exit(1);
-    }
-
-    int on = 1;
-    if (setsockopt (send_socket, IPPROTO_IP, IP_HDRINCL, &on, sizeof (on)) < 0) {
-        perror ("setsockopt() failed to set IP_HDRINCL ");
-        exit (EXIT_FAILURE);
-    }
-
-    /* Make IP header checksum */
-    send_tcp.ip.check = in_cksum((unsigned short *)&send_tcp.ip, 20);
-    /* Final preparation of the full header */
-
-    /* From synhose.c by knight */
-    pseudo_header.source_address = send_tcp.ip.saddr;
-    pseudo_header.dest_address = send_tcp.ip.daddr;
-    pseudo_header.placeholder = 0;
-    pseudo_header.protocol = IPPROTO_TCP;
-    pseudo_header.tcp_length = htons(20);
-
-    uint8_t *packet = (uint8_t *)malloc(IP_MAXPACKET * sizeof(uint8_t));
-
-    bcopy((char *)&send_tcp.tcp, (char *)&pseudo_header.tcp, 20);
-    /* Final checksum on the entire package */
-    send_tcp.tcp.check = in_cksum((unsigned short *)&pseudo_header, 32);
-
-    bcopy((char *)&send_tcp.tcp, (char *)&pseudo_header.tcp, 20);
-    /* Final checksum on the entire package */
-    send_tcp.tcp.check = in_cksum((unsigned short *)&pseudo_header, 32);
-
-    sendto(send_socket, &send_tcp, 40 + (sizeof(char) * 1000), 0, (struct sockaddr *)&sin, sizeof(sin));
-
-//    const int IP4_HDRLEN = 20;
-//    const int TCP_HDRLEN = 20;
-
-    // First part is an IPv4 header.
-//    memcpy (packet, &send_tcp.ip, IP4_HDRLEN * sizeof (uint8_t));
-
-    // Next part of packet is upper layer protocol header.
-//    memcpy ((packet + IP4_HDRLEN), &send_tcp.tcp, TCP_HDRLEN * sizeof (uint8_t));
-
-    // Last part is upper layer protocol data.
-//    memcpy ((packet + IP4_HDRLEN + TCP_HDRLEN), payload, payloadlen * sizeof (uint8_t));
-
-
-    /* Away we go.... */
-//    sendto(send_socket, packet, IP4_HDRLEN + TCP_HDRLEN + payloadlen, 0, (struct sockaddr *)&sin, sizeof(sin));
-    //printf("Sending Data: %c\n",ch);
-
-    while(1){
-
-    }
-
-    close(send_socket);
 
 
     /*buf = "HTTP/1.1 200 OK\r\n";
@@ -440,6 +496,5 @@ int main(int argc, char *argv[]){
 
     shutdown(socketSessionDescriptor, SHUT_RDWR);
     close(socketSessionDescriptor);*/
-
 
 }
